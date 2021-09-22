@@ -1,0 +1,80 @@
+---
+title: "Optimisation Method Comparison"
+author: "Thalia Eleni Seale"
+date: "13/09/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+
+load(".RData")
+
+comparison_frame <- rbind(design_frame_345,design_frame_hetero)
+```
+
+In this document, we compare two possible optimisation methods, linear optimisation using an objective function that weights pico groups of certain sizes higher (345 method), and quadratic optimisation using an objective function that also accounts for the heterogeneity in groups.
+
+# Number of Pico Comparisons and number of studies used.
+
+|Optimisation Method                     |Number of Pico Groups                           |Number of Studies Used| 
+|----------------------------------------|------------------------------------------------|----------------------|
+|prioritising grooups of size 3, 4, and 5|`r length(unique(design_frame_345$pico_id))`    |`r length(unique(design_frame_345$pub_id))`     |
+|quadratic heterogeneity term            |`r length(unique(design_frame_hetero$pico_id))`|`r length(unique(design_frame_hetero$pub_id))`     
+
+Both methods use the same number of studies, but the number of pico comparisons for the 345 method is greater.
+
+# Comparison of group sizes
+
+```{r}
+comparison_frame %>%
+  group_by(optimisation_method,pico_id) %>%
+  summarise(group_size = n_distinct(pub_id)) %>%
+  group_by(group_size,optimisation_method) %>%
+  summarise(count= n()) %>%
+  pivot_wider(id_cols = optimisation_method,names_from = group_size,values_from = count)
+```
+The 345 method has a greater number of studies of the ideal size and not much fewer of the other sizes.
+
+# Number of Unique Designs
+
+```{r}
+comparison_frame %>%
+  group_by(pico_id,optimisation_method) %>%
+  summarise(num_unique_designs = n_distinct(Design)) %>%
+  ggplot() +
+  geom_histogram(aes(x = num_unique_designs)) +
+  facet_wrap(.~optimisation_method)
+```
+
+The following table compares the number of different pico groups with containing n different group designs.
+
+```{r}
+comparison_frame %>%
+  group_by(pico_id,optimisation_method) %>%
+  summarise(num_unique_designs = n_distinct(Design)) %>%
+  group_by(optimisation_method,num_unique_designs) %>%
+  summarise(count = n()) %>%
+  pivot_wider(id_cols = optimisation_method,names_from = num_unique_designs,values_from = count)
+```
+The quadratic optimisation produces larger groups with more diverse designs, but performs similarly or worse for groups that are smaller.
+
+# Number of groups containing at least one randomised study
+
+The following table shows whether the studies contain at least one randomised and non-randomised study:
+
+```{r}
+comparison_frame %>%
+  group_by(pico_id,optimisation_method) %>%
+  summarise(contains_non_randomised = any(!randomised)) %>%
+  group_by(optimisation_method,contains_non_randomised) %>%
+  summarise(count = n()) %>%
+  pivot_wider(id_cols = optimisation_method,names_from = contains_non_randomised,values_from = count)
+```
+The 345 methods has more groups with at least one randomised and one non randomised design.
+
+# Conclusion
+
+Overall, it seems that the 345 method performs slightly better than the quadratic method.
