@@ -1,0 +1,166 @@
+---
+title: "R Notebook"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r,setup=TRUE}
+library(tidyverse)
+library(rstan)
+```
+
+
+# The Model
+
+Let $\hat{\beta_{ij}}$ be the log response ratio estimate for study j in pico group i, where
+\begin{align}
+i = 1,\dots, m ,
+j = 1,\dots, n_i,
+\end{align}
+where m is the number of pico comparison groups and $n_i$ is the number of publications in each comparison group.
+
+In our model, the log response ratio estimate $\hat{\beta_{ij}}$ is modelled by
+\begin{align}
+\hat{\beta_{ij}} = \beta_i + \gamma_{ij} + \epsilon_{ij},
+\end{align}
+where $\beta_i$ is the log response ratio for pico comparison i, $\gamma_{ij}$ is design bias in study j in pico comparison i and $\epsilon_{ij}$ is the random error in study j in pico comparison i. These components are in turn modelled by:
+\begin{align}
+\beta_j &\sim \mathcal{N}(0,\sigma_\beta^2), \\
+\gamma_{ij} &\sim \mathcal{N}(0,\sigma^2(X_{ij})), \\
+\epsilon_{ij} &\sim \mathcal{N}(0,\sigma_{ij}^2).
+\end{align}
+where $X_{ij}$ is a vector of design features of study j in group i, $\sigma_{ij}$ is the standard error, and
+\begin{align}
+\log \sigma^2(X_{ij}) = X_ij^T \theta .
+\end{align}
+We also assume weakly informative prior distributions:
+\begin{align}
+\sigma_\beta \sim \text{InvGamma}(1,0.02), \\
+\theta_i \sim \mathcal{N}(0,1.52) .
+\end{align}
+
+For now we are interested in the following design features:
+- Randomisation,
+- Controls,
+- Before-after,
+- Presence of all three previous features, i.e. BACI design.
+So we set:
+\begin{align}
+X_{ij} = \begin{pmatrix} 1 \\
+x_\text{randomised} \\
+x_\text{controlled} \\
+x_\text{before-after} \\
+x_\text{BACI} \\
+\end{pmatrix},
+\end{align}
+where the first element of the vector is the intercept, and x_\dots is a dummy coding variable for the features we are considering.
+
+# Constructing the model in Stan
+
+```{stan output.var="model"}
+data {
+  int<lower=0> m; // number of pico comparisons
+  int<lower=0> n[m]; // array of studies in each comparison
+  int<lower=0> n_tot; // total number of studies in the model
+  vector[n_tot] log_response; // log responses for all studies
+  vector[n_tot] est_var; // estimated variance for all studies
+  int<lower=0> d; // number of columns in X
+  matrix[n_tot,d] X; // design matrix
+}
+
+parameters {
+  vector[m] beta; // vector of log responses for the pico comparisons
+  real<lower=0> sigma_beta; // standard deviation for each of the pico comparisons
+  vector[d] theta; // vector of coefficients for the transformed linear relation between variance of gamma_ij and X_ij
+}
+
+model {
+  int k; // this is an indexing variable for later
+  
+  sigma_beta ~ inv_gamma(1,0.02); // prior for sigma_beta
+  
+  beta ~ normal(0,sigma_beta); // prior for beta
+  
+  theta ~ normal(0,1.52); // prior for theta
+  
+  k = 1;
+  for(i in 1:m){
+    for(j in 1:n[i]){
+      log_response[k] ~ normal(beta[i],sqrt(est_var[k] + exp(X[k,]*theta))); // relation between estiated log response and other random quantities
+      k = k+1;
+    }
+  }
+}
+
+
+```
+
+# Fitting the model to the data
+
+The comparison group design is determined using linear optimisation techniques:
+
+```{r}
+load("stan_data.Rdata")
+design_frame_345
+```
+
+In this next step, we are adding the relevant `log_response_ratio`, `selected_v` and `Design` information to the design frame:
+
+```{r}
+test_design <- design_frame_345 %>%
+  select(pico_id,pub_id,rowid) #selecting the relevant information from the design frame
+test_design <- merge(test_design,select(Metadataset_download_19_08_21,rowid,log_response_ratio,selected_v,Design),) #adding information on the log response rato, variance and Designt to the design frame
+test_design <- test_design %>%
+  arrange(pico_id) #arranging by pico_id
+test_design
+```
+Using the `test_design` we can now record data for the Stan model:
+
+```{r}
+stan_data <- list(
+  m = length(unique(test_design$pico_id)), #since m is the number of pico comparisons
+  
+  n = as.array((test_design %>%
+                  group_by(pico_id) %>%
+                  summarise(num_publications = n_distinct(pub_id)))$num_publications), #this is the number of distinct publications in each group, and is inputted as an array as this is the variable type of n in the model
+  
+  n_tot = sum(as.array((test_design %>%
+                      group_by(pico_id) %>%
+                      summarise(num_publications = n_distinct(pub_id)))$num_publications)), #this is the total number of publications in each group
+  
+  log_response = as.vector(test_design$log_response_ratio), #this is the vector of log response ratios
+  
+  est_var = as.vector(test_design$selected_v), #this is the vector of variances for the log response ratio
+  
+  d = 5, #specifies number of comparisons we are interested in (including the intercept)
+  
+  #Design matrix:
+  X = as.matrix(test_design %>%
+                  select(Design) %>%
+                  mutate(randomised = str_detect(Design,"(R|r)andom"),
+                         controlled = str_detect(Design,"(C|c)ontrol"),
+                         before_after = str_detect(Design,"(B|b)efore"),
+                         BACI = controlled & before_after) %>% #creating columns containing boulean values indicating presence of design features of interest
+                  select(-Design) %>% #removing un-needed columns
+                  mutate(across(.cols = everything(),~if_else(.,1,0))) %>% #converting the bouleans into binary variables
+                  mutate(intercept = 1) %>% #adding an intercept column
+                  select(intercept,randomised,controlled,before_after,BACI))
+) #rearranging for desired order of columns
+```
+
+Now we fit the Stan model to the data:
+
+```{r}
+fit <- sampling(model,data = stan_data)
+fit
+```
+The chains appear to converge:
+
+```{r,fig.width=20,fig.height=20}
+library(bayesplot)
+
+fit %>%
+  mcmc_trace()
+```
+
