@@ -1,0 +1,708 @@
+---
+title: "Preparing the dataset and Optimisation"
+output:
+  html_document:
+    df_print: paged
+  pdf_document: 
+    keep_tex: yes
+---
+
+# Preparing the Dataset
+
+```{r,setup, include = FALSE}
+library(readr)
+# Metadataset_download_19_08_21 <- read_csv("Meta-analysis data/Metadataset_download_19_08_21.csv")
+
+Metadataset_download_19_08_21 <- read_csv("Meta-analysis data/metadataset_03_09_21.csv")
+
+library(tidyverse)
+library(forcats)
+```
+
+To find the unique comparison groups, we only need the unique row ID (`rowid`), publication ID (`publication_id`), pico (``pico (unique comparison)``) and the study designs (`Design`). The pico is formed from information about the population, intervention and outcome being measured.
+
+```{r}
+metadataset <- Metadataset_download_19_08_21 %>%
+  mutate(`pico (unique comparison)` = paste(population,intervention,outcome,sep = " ")) %>%
+  filter(!is.na(Design),!is.na(log_response_ratio),!is.na(selected_v)) %>%
+  filter(!is.na(Design)) %>%
+  #subsetting the columns
+  select(rowid,publication_id,`pico (unique comparison)`,Design) %>% 
+  #creating a column to show randomisation
+  mutate(randomised = str_detect(Design,"(R|r)andom")) %>%
+  #creating a column for control before and after
+  mutate(controlled = str_detect(Design,"(C|c)ontrol"),
+         before_after = str_detect(Design,"(B|b)efore")) 
+head(metadataset)
+```
+These values in some of the categories are quite cumbersome, so I have assigned a unique integer to each pico and a unique integer to each publication, to replace the original IDs:
+
+```{r}
+#Data frame containing the codes for each of the picos
+pico_id_frame <- data.frame(pico = unique(metadataset$`pico (unique comparison)`),
+                            pico_id = 1:length(unique(metadataset$`pico (unique comparison)`)))
+#Data frame containing the codes for each of the publications
+publication_id_frame <- data.frame(publication_id = unique(metadataset$publication_id),
+                                   pub_id = 1:length(unique(metadataset$publication_id)))
+
+#Adding the new columns containing the IDs
+metadataset <- merge(metadataset,pico_id_frame,by.x = "pico (unique comparison)",by.y = "pico")
+metadataset <- merge(metadataset,publication_id_frame,by="publication_id")
+
+#Removing the pre-existing columns for clarity
+metadataset <- metadataset %>%
+  select(-publication_id,-`pico (unique comparison)`)
+
+head(metadataset)
+
+```
+
+# Initial observations
+
+We want to know how large the pico groups are, so we group the dataframe by pico_id and summarise to find the number distinct publications in each group and whether the group contains a randomised study:
+
+```{r}
+pico_group_sizes <- metadataset %>%
+  group_by(pico_id) %>%
+  summarise(group_size = n_distinct(pub_id),contains_random = any(randomised))
+
+metadataset <- merge(metadataset,pico_group_sizes,by="pico_id") #adding the group information to the dataframe for computations later...
+```
+
+The following plot shows the distribution of different group sizes greater than 1:
+
+```{r,out.width="70%",fig.align="center"}
+pico_group_sizes %>%
+  filter(group_size > 1) %>%
+  ggplot() +
+  geom_histogram(aes(x = group_size,fill = contains_random),binwidth = 1) +
+  facet_wrap(contains_random~.,ncol = 1) +
+  scale_x_continuous(breaks = 0:10*4) +
+  ggtitle("Histogram showing distribution of different comparison group sizes >= 1")
+```
+
+
+The following table shows the number of number of pico comparisons in each group size:
+
+```{r}
+pico_group_sizes %>%
+  group_by(group_size,contains_random) %>%
+  summarise(number_of_comparisons = n()) %>%
+  pivot_wider(names_from = contains_random,values_from = number_of_comparisons)
+```
+
+Overall there are `r length(unique(filter(metadataset,group_size>1)$pico_id))` pico groups with size greater than 1, which contain `r length(unique(filter(metadataset,group_size>1)$pub_id))` publications.
+
+# Naive Optimisation
+
+Now we want to find the number of comparison groups when restrict studies to only appearing in one comparison group.
+
+We can use a greedy algorithm type process to obtain the greatest number of groups, following these steps:
+
+1. Order the pico groups beginning with the groups with the smallest number of studies and increasing in number.
+2. Sequentially add groups to the experiment design, removing the publications added from the pool of studies, and removing comparison groups which are no longer viable due to not containing a random study or not being large enough.
+
+The following functions implement this idea:
+
+```{r}
+#function finds the comparison groups given the metadataset
+find.groups <- function(metadataset){
+  metadataset <- metadataset %>%
+    #remove comparison groups with only one entry, and contains_random without data
+    filter(group_size > 1,!is.na(contains_random),!is.na(randomised)) %>%
+    #arranges into groups containing random/not containng random, sorts by group size within
+    arrange(desc(contains_random),group_size) %>%
+    #we filter out duplicated publicatinos within a comparison group
+    distinct(pico_id,pub_id,.keep_all = TRUE) 
+  
+  design_frame <- metadataset %>%
+    filter(pico_id == 0) #creating an empty data frame to record our study design
+  
+  md <- list(metadataset,design_frame) #this list just holds the two variables for convenience
+  
+  while (nrow(md[[1]]) > 0) { #we keep iterating until there are no more pico groups left in the data frame
+    md <- check.group(md[[1]],md[[2]])
+  }
+  return(md)
+}
+
+#function checks that the pico group at the top of the list can be added to the design frame
+check.group <- function(metadataset,design_frame){
+  #First we draw the data pico comparison group at the top of the metadataset
+  pico_id_current <- filter(metadataset,pico_id == metadataset$pico_id[1])
+  #Now we check to see whether the comparison group is still larger than 2 and contains at least one randomised study
+  if(nrow(pico_id_current) >= 2 & any(pico_id_current$randomised)){
+    #If the group satisfies the conditions we can add this group to our list of comparison groups
+    design_frame <- rbind(design_frame,pico_id_current)
+    #Then we filter the studies contained within this comparison group since they can no longer be used
+    metadataset <- metadataset %>%
+      filter(!(pub_id %in% pico_id_current$pub_id))
+  }else{
+    metadataset <- metadataset %>%
+      filter(pico_id != pico_id_current$pico_id[1]) #otherwise we remove this pico as it is not viable
+  }
+  return(list(metadataset,design_frame))
+}
+```
+
+Applying this to the data frame we have the following unique comparisons:
+
+```{r}
+design_frame <- find.groups(metadataset)[[2]]
+
+new_pico_group_sizes <- design_frame %>%
+  group_by(pico_id) %>%
+  summarise(new_group_size = n_distinct(pub_id),contains_random = any(randomised))
+
+design_frame <- merge(design_frame,new_pico_group_sizes,by="pico_id")
+design_frame
+```
+
+This gives us `r length(unique(design_frame$pico_id))` comparison groups, containing `r length(unique(design_frame$pub_id))` publications, which means that we have been able to utilise `r length(unique(design_frame$pub_id))/length(unique(filter(metadataset,group_size>1)$pub_id))` of the original number of studies that were eligible for comparison.
+
+The following graph shows the distribution of the group sizes:
+
+```{r,out.width="70%",fig.align="center"}
+new_pico_group_sizes %>%
+  ggplot() +
+  geom_histogram(aes(x = new_group_size),binwidth = 1) +
+  scale_x_continuous(breaks = 0:15) +
+  ggtitle("Distribution of comparison group sizes (studies included once)")
+```
+
+```{r}
+new_pico_group_sizes %>%
+  group_by(new_group_size) %>%
+  summarise(number_of_comparisons = n())
+```
+
+# Gurobi optimisation
+
+## Initial optimisation
+
+We can use Gurobi to maximise the number of groups.
+
+```{r}
+library ( gurobi )
+
+model <- list() #this object contains all of the model parameters
+```
+
+If $A_{ij}$ is the indicator variable for whether publication i is contained in contained in comparison j, then the requirement that each study be included just once is summarised by
+\begin{align}
+\sum A_{ij} s_{ij} \leq 1,
+\end{align}
+where $s_{ij} \in \{0,1\}$ indicates the inclusion of publication $i$ in pico comparison $j$.
+
+The linear combination we can maximise is $\sum s_{ij}$, as this would indicate that we have included the greatest number of studies.
+
+First we need to make a matrix encoding the linear constraints, this can be done by transforming the data frame so that we have each row representing a publication, and columns representing inclusion or exclusion for each combination of publication and pico comparison.
+
+```{r}
+A_ij <- metadataset %>%
+  filter(group_size > 1,contains_random) %>% #we remove groups of less than 2 as this does not allow for comparison
+  arrange(group_size) %>% #arranging by group size will help customise the objective function
+  distinct(pub_id,pico_id) %>%
+  mutate(value = 1,pub_id_2 = pub_id) %>%
+  pivot_wider(id_cols = pub_id,names_from = c(pico_id,pub_id_2),values_from = value,values_fill =  0) #this transforms the data frame into the structure of matrix required
+
+A_ij
+
+#We remove the pub_ids from the matrix
+A_ij$pub_id <- NULL
+
+#Finally we add the matrix to the model
+model$A <- as.matrix(A_ij)
+```
+
+We also have some general constraints for the pico comparison groups. We require that if the group is part of our experiment design, it is to have 2 or more elements. We can formulate this as a conditional constraint that if one study from the pico group is included in the solution, then the number of studies in that pico group must be greater than 2. I.e.:
+\begin{align}
+s_{ij} = 1 \implies \sum_j s_{ij} \geq 2, \forall i, \forall j .
+\end{align}
+
+Additionally, we require each comparison group to have at least one randomised study. Thus we require:
+\begin{align}
+s_{ij} = 1 \implies \sum_j s_{ij} 1(A_i) \geq 1, \forall i, \forall j ,
+\end{align}
+where $A_i$ is the event that study i is randomised.
+
+```{r}
+#The following table gives each s_ij a number
+variable_key <- metadataset %>%
+  filter(group_size > 1,contains_random) %>% #we remove groups of less than 2 as this does not allow for comparison
+  arrange(group_size) %>% #arranging by group size will help customise the objective function
+  distinct(pub_id,pico_id,.keep_all = TRUE) %>%
+  select(pub_id,pico_id,randomised)
+variable_key$variables <- 1:dim(variable_key)[1] #gives index of the variable
+
+#Now we create the constraints for each variable
+variable_key$linear_constraints <- rep(0,dim(variable_key)[1]) #creating empty column to contain the linear constraint
+#We go through each variable and list the constraint that depends on it
+
+for(i in 1:dim(variable_key)[1]){
+  this_pico_id <- filter(variable_key,variables == variable_key$variables[i])$pico_id #this gives the pico_id associated with the variable
+  
+  #this is the constraint requiring >=2 studies in each group
+  group_size_constraint <- mutate(variable_key,linear_constraint = ifelse(pico_id == this_pico_id,1,0))$linear_constraint #we find the other publications in the pico comparison in order to produce the linear part of the constraint
+
+  model$genconind[[2*i-1]] <- list()  #initialising the constraint
+  model$genconind[[2*i-1]]$binvar <- i #index of the variable that triggers the constraint
+  model$genconind[[2*i-1]]$binval <- 1 #the value that the variable in question takes to trigger the constraint
+  model$genconind[[2*i-1]]$a <- group_size_constraint #the linear part of the constraint
+  model$genconind[[2*i-1]]$sense <- ">" #sense of the constraint
+  model$genconind[[2*i-1]]$rhs <- 2 #right hand side of the constraint
+  
+  #this is the constraint since requiring >=1 random studies in each group
+  random_constraint <- mutate(variable_key,linear_constraint = ifelse(pico_id == this_pico_id & randomised,1,0))$linear_constraint #similarly we find the other random publications in the pico comparison to produce the linear part of the constraint
+  model$genconind[[2*i]] <- list()
+  model$genconind[[2*i]]$binvar <- i
+  model$genconind[[2*i]]$binval <- 1
+  model$genconind[[2*i]]$a <- random_constraint
+  model$genconind[[2*i]]$sense <- ">"
+  model$genconind[[2*i]]$rhs <- 1
+}
+
+#An example condition:
+model$genconind[[1]]
+```
+Now we set the other model features:
+
+```{r}
+#For now we set the objective function to the total number of pico groups active
+model$obj <- rep(1,ncol(A_ij))
+
+#Model sense, i.e. maximise or minimise the utility
+model$modelsense <- "max"
+
+#The right hand side of the constraints
+model$rhs <- rep(1,nrow(A_ij))
+
+#Direction of the inequalities
+model$sense <- rep("<",nrow(A_ij))
+
+#The variables have to be binary
+model$vtype <- "B"
+
+params <- list(OutputFlag=0)
+```
+
+Solution:
+
+```{r}
+result <- gurobi(model,params)
+```
+
+The study design proposed by this optimisation is given by:
+
+```{r}
+#Creating the data frame for the solution 
+design_frame_gurobi <- metadataset %>%
+  filter(group_size > 1,contains_random) %>% #we remove groups of less than 2 as this does not allow for comparison
+  arrange(group_size) %>% #arranging by group size will help customise the objective function
+  distinct(pub_id,pico_id,.keep_all = TRUE)
+design_frame_gurobi$solution <- result$x #adding the gurobi solution
+design_frame_gurobi <- design_frame_gurobi %>%
+  filter(solution == 1) %>%
+  select(-solution) #filtering to just show solution
+
+#Adding new group sizes
+
+new_pico_group_sizes_gurobi <- design_frame_gurobi %>%
+  group_by(pico_id) %>%
+  summarise(new_group_size = n_distinct(pub_id),contains_random = any(randomised))
+
+design_frame_gurobi <- merge(design_frame_gurobi,new_pico_group_sizes_gurobi,by="pico_id")
+design_frame_gurobi
+```
+
+We just want to check that each group contains a random study:
+
+```{r}
+any(design_frame_gurobi$contains_random_after) #if there are any contains_random_after that are false then this result will also be false
+```
+
+
+The number of pico groups included is `r length(unique(design_frame_gurobi$pico_id))`. The number of studies used by the gurobi optimisation is `r sum(result$x)`, which is `r sum(result$x)/length(unique(filter(metadataset,group_size>1)$pub_id))` of the available publications.
+
+The following histogram shows the distribution of group sizes:
+
+```{r,out.width="70%",fig.align="center"}
+new_pico_group_sizes_gurobi %>%
+  ggplot() +
+  geom_histogram(aes(x = new_group_size),binwidth = 1) +
+  scale_x_continuous(breaks = 0:40) +
+  ggtitle("Distribution of comparison group sizes (studies included once, gurobi)")
+```
+
+
+## Adjusting group utility
+
+We can change the objective function to prioritise groups of a certain size.
+
+Suppose I want to have more comparisons with 3, 4 or 5 elements, I can set the linear objective functions so that studies which had 3 studies are slightly more important.
+
+```{r}
+objective <- metadataset %>%
+  filter(group_size > 1,contains_random) %>% #we remove groups of less than 2 as this does not allow for comparison
+  arrange(group_size) %>% #arranging by group size will help customise the objective function
+  distinct(pub_id,pico_id,.keep_all = TRUE) %>%
+  mutate(obj = ifelse(group_size %in% 3:5,8,1))
+
+model$obj <- objective$obj #set the new weights for the objective function
+
+result <- gurobi(model,params)
+```
+
+
+The following histogram shows the distribution of group sizes:
+
+```{r,out.width="70%",fig.align="center"}
+#Creating the data frame for the solution 
+design_frame_345 <- metadataset %>%
+  filter(group_size > 1,contains_random) %>% #we remove groups of less than 2 as this does not allow for comparison
+  arrange(group_size) %>% #arranging by group size will help customise the objective function
+  distinct(pub_id,pico_id,.keep_all = TRUE)
+design_frame_345$solution <- result$x #adding the gurobi solution
+design_frame_345 <- design_frame_345 %>%
+  filter(solution == 1) %>%
+  select(-solution) #filtering to just show solution
+
+#Adding new group sizes
+
+new_pico_group_sizes_345 <- design_frame_345 %>%
+  group_by(pico_id) %>%
+  summarise(new_group_size = n_distinct(pub_id),contains_random = any(randomised))
+
+design_frame_345 <- merge(design_frame_345,new_pico_group_sizes_345,by="pico_id")
+design_frame_345
+
+new_pico_group_sizes_345 %>%
+  ggplot() +
+  geom_histogram(aes(x = new_group_size),binwidth = 1) +
+  scale_x_continuous(breaks = 0:40) +
+  ggtitle("Distribution of comparison group sizes (studies included once, gurobi)")
+```
+
+The number of pico groups included is `r length(unique(design_frame_345$pico_id))`. The number of studies used by the gurobi optimisation is `r sum(result$x)`, which is `r sum(result$x)/length(unique(filter(metadataset,group_size>1)$pub_id))` of the available publications.
+
+
+## Group heterogeneity
+
+For the purposes of the study, it would be desirable if the groups were quite heterogeneious. One way to incorporate heterogeneity into the objective function is by adding a quadratic term. Looking at the `metadataset` data frame, we can determine how different two studies are by looking at the `controlled` and `before_after` columns. If two studies have the same values for any of these columns, they could be considered quite similar. Otherwise if they have different values, they are different.
+
+```{r}
+metadataset %>%
+  select(pub_id,pico_id,controlled,before_after,randomised)
+```
+We can therefore define a dissimilarity index $q_{kl}$, given by:
+\begin{align}
+q_{kl} = 1(\text{controlled}_i = \text{controlled}_j) + 1(\text{before_after}_i = \text{before_after}_j),
+\end{align}
+$\text{controlled}_k$ and $\text{before_after}_k$ are bouleans indicating if study k is controlled and before-after respectively. Essentially, $q_{kl}$ is the total of the points of similarity between study $k$ and study $l$.
+
+We can use this similarity index to define a matrix $Q \in \mathbb{R}^{N \times N}$ (where $N$ is the total number of possible inclusions of publications in pico groups), given by:
+\begin{align}
+Q_{(ij)(kl)} = q_{ik} 1(j = l) , \forall i, k \in \{1, \dots , I\}, \forall j, l \in \{1,\dots, J\}.
+\end{align}
+That is, an entry of matrix Q is 0 if two studies are not in the same pico group, since we do not care about heterogeneity between pico groups, but is equal to the dissimilarity index if the two studies are in the same pico group.
+
+```{r}
+metadataset_copy <- metadataset %>%
+  filter(group_size > 1,contains_random) %>% #we remove groups of less than 2 as this does not allow for comparison
+  arrange(group_size) %>% #arranging by group size will help customise the objective function
+  distinct(pub_id,pico_id,.keep_all = TRUE)
+
+#Let's create a matrix. It has to be square with dimention equal to the number of factors so:
+N <- ncol(A_ij)
+Q <- matrix(,nrow = N,ncol = N)
+#Now we loop though each element of the matrix determining whether the two publications are in the same pico group and are different types of studies
+for(i in 1:N){
+  for(j in 1:N){
+    if(metadataset_copy$pico_id[i] == metadataset_copy$pico_id[j]){ #if the two studies are in the same pico group, we are interested in how different they are
+      not_both_controlled <- ifelse(metadataset_copy$controlled[i] != metadataset_copy$controlled[j],1,0) #if one is controlled and the other is not, this is useful, so we set this variable to 1
+      not_both_before_after <- ifelse(metadataset_copy$before_after[i] != metadataset_copy$before_after[j],1,0) #if one is controlled and the other is not, this is useful, so we set this variable to 1
+      Q[i,j] <- not_both_controlled + not_both_before_after #this encodes the difference between the two studies
+    }else{ #if not in the same pico group, we are not interested in the difference, so:
+      Q[i,j] <- 0
+    }
+  }
+}
+```
+
+
+Recalling that $s_{ij}$ is the factor coding for the inclusion of study i in pico comparison j, let the vector $\mathbf{s} \in \{0,1\}^{ij}$ be a vector containing the factor codings. Then $\mathbf{s}^T Q \mathbf{s}$ quantifies the total in-pico-comparsion-heterogeneity of our solution, since:
+\begin{align}
+\mathbf{s}^T Q \mathbf{s} = \sum q_{ik} 1(j = l) s_{ij} s_{kl},
+\end{align}
+so the dissimilarity index is only included if the study-pico-comparison combinatinos ij and kl are both present.
+
+Gurobi allows us to use an objective function of the form $\mathbf{x}^T Q \mathbf{x} + q^t \mathbf{x}$, so an objective function composed of a linear and quadratic part. We have so far found a linear and quadratic objective function that we would like to use, however, we still need to determine what linear combination of these two functions is appropriate.
+
+Let $V(\mathbf{s})$ be the utility of $\mathbf{s}$ *due to the inclusion of more studies*. I.e., this utility expresses our desire to use as much of our data set as possible. Let $W(\mathbf{s})$ be the utility of $\mathbf{s}$ *due to heterogeneity within pico groups.* I.e., this utility expresses our desire to have heterogeneous pico groups. Since the Gurobi objective function must be either linear or quadratic we let
+\begin{align}
+V(\mathbf{s}) &= q^t \mathbf{s} \\
+W(\mathbf{s}) &= \mathbf{s}^T Q \mathbf{s},
+\end{align}
+and let the objective function be given by
+\begin{align}
+U(\mathbf{s}) = V(\mathbf{s}) + a W(\mathbf{s}),
+\end{align}
+$a \in \mathbb{R}$. $a$ may be determined by a suitable tradeoff between number of studies included and pico group heterogeneity.
+
+Suppose that I deem that I am willing to trade some comparison groups equivalent to utility V in order to achieve maximum possible pico group heterogeneity. In the previous section, I deemed pico groups of size 3 to have a utility of 4 (not exactly but something like that given the restrictions of using a linear objective function). Thus utility lost by sacrificing two comparison groups size 3 is 8. What is the maximum value for pico group heterogeneity using $W(\mathbf{s})$? Since every value of Q is positive, an upper bound for this utility is given by
+\begin{align}
+max_\mathbf{s}(W(\mathbf{s})) = 1_{IJ}^T Q 1_{IJ} .
+\end{align}
+Thus we have two equivalent utilities, that give us the relation
+\begin{align}
+V = a 1_{IJ}^T Q 1_{IJ} \implies a = \frac{V}{1_{IJ}^T Q 1_{IJ}} .
+\end{align}
+
+Suppose I am willing to trade five comparison groups size 3 for maximum heterogeneity. In the previous section I set the utility of a comparison group size at 4, thus $V = 12$. This gives us a value for $a$:
+
+```{r}
+a <- (15 / (rep(1,ncol(Q))%*% Q %*% rep(1,ncol(Q))))[1,1]
+a
+```
+
+So we set quadratic objective:
+
+```{r}
+model$Q <- a*Q
+
+result <- gurobi(model,params)
+```
+
+The number of pico groups included is `r length(unique(design_frame_gurobi$pico_id))`. The number of studies used by the gurobi optimisation is `r sum(result$x)`, which is `r sum(result$x)/length(unique(filter(metadataset,group_size>1)$pub_id))` of the available publications.
+
+Like with previous solutions we look at the distribution of group sizes:
+
+```{r,out.width="70%",fig.align="center"}
+#Creating the data frame for the solution 
+design_frame_hetero <- metadataset_copy %>%
+  filter(group_size > 1,contains_random) %>% #we remove groups of less than 2 as this does not allow for comparison
+  arrange(group_size) %>% #arranging by group size will help customise the objective function
+  distinct(pub_id,pico_id,.keep_all = TRUE)
+design_frame_hetero$solution <- result$x #adding the gurobi solution
+design_frame_hetero <- design_frame_hetero %>%
+  filter(solution == 1) %>%
+  select(-solution) #filtering to just show solution
+
+#Adding new group sizes
+
+new_pico_group_sizes_hetero <- design_frame_hetero %>%
+  group_by(pico_id) %>%
+  summarise(new_group_size = n_distinct(pub_id),contains_random = any(randomised))
+
+design_frame_hetero <- merge(design_frame_hetero,new_pico_group_sizes_hetero,by="pico_id")
+design_frame_hetero
+
+new_pico_group_sizes_hetero %>%
+  ggplot() +
+  geom_histogram(aes(x = new_group_size),binwidth = 1) +
+  scale_x_continuous(breaks = 0:30*2) +
+  ggtitle("Distribution of comparison group sizes (studies included once, hetero)")
+```
+
+Comparing the distribution of group sizes with the other solutions:
+
+```{r,out.width="70%",fig.align="center"}
+#Adding a series column to the data frames before we combine them for the graph
+new_pico_group_sizes <- new_pico_group_sizes %>%
+  mutate(optimisation_method = "naive")
+new_pico_group_sizes_gurobi <- new_pico_group_sizes_gurobi %>%
+  mutate(optimisation_method = "gurobi 1") %>%
+  select(pico_id,new_group_size,contains_random,optimisation_method)
+new_pico_group_sizes_345 <- new_pico_group_sizes_345 %>%
+  mutate(optimisation_method = "prioritising groups of size of 3, 4 and 5")
+new_pico_group_sizes_hetero <- new_pico_group_sizes_hetero %>%
+  mutate(optimisation_method = "quadratic heterogeneity term")
+
+rbind(new_pico_group_sizes,
+      new_pico_group_sizes_gurobi,
+      new_pico_group_sizes_345,
+      new_pico_group_sizes_hetero) %>%
+  ggplot() +
+  geom_histogram(aes(x = new_group_size),binwidth = 1) +
+  scale_x_continuous(breaks = 0:30*2) +
+  ggtitle("Distribution of group sizes using different optimisation technques") +
+  facet_wrap(.~fct_relevel(optimisation_method,"naive","gurobi 1","prioritising groups of size of 3, 4 and 5","quadratic heterogeneity term"),ncol=1)
+  
+```
+
+
+How does group heterogeneity compare with other solutions? Suppose we count the number of distinct study types for each pico group and plot this on a histogram:
+
+```{r,out.width="70%",fig.align="center"}
+#Labelling the designs for the plot
+design_frame <- design_frame %>%
+  mutate(optimisation_method = "naive")
+design_frame_gurobi <- design_frame_gurobi %>%
+  mutate(optimisation_method = "gurobi 1")
+design_frame_345 <- design_frame_345 %>%
+  mutate(optimisation_method = "prioritising groups of size of 3, 4 and 5")
+design_frame_hetero <- design_frame_hetero %>%
+  mutate(optimisation_method = "quadratic heterogeneity term")
+
+heterogeneity_plot <- rbind(select(design_frame,pico_id,controlled,before_after,optimisation_method),
+                            select(design_frame_gurobi,pico_id,controlled,before_after,optimisation_method),
+                            select(design_frame_345,pico_id,controlled,before_after,optimisation_method),
+                            select(design_frame_hetero,pico_id,controlled,before_after,optimisation_method))
+heterogeneity_plot <- heterogeneity_plot %>%
+  distinct() %>%
+  group_by(pico_id,optimisation_method) %>%
+  summarise(heterogeneity = n())
+
+heterogeneity_plot %>%
+  ggplot() +
+  geom_freqpoly(aes(x = heterogeneity,colour = optimisation_method))
+```
+It appears that adding the quadratic term does not have a huge effect on the result, other than having one or two more groups containing 2 different types of study.
+
+## Objective function based on pico groups
+
+In this subsection, I explore optimising instead based on maximising the number of pico groups in the comparison.
+
+Let $s_j$ be the indicator variable for the inclusion of pico comparison $j$. Note that
+\begin{align}
+s_j = \max\{s_{ij}:\forall i \in \{ 1,\dots,I \}\}, \label{max_constraint}
+\end{align}
+since if any of $s_{ij} = 1$, this implies the inclusion of pico comparison $j$, so $s_j = 1$ also, but if none of $s_ij = 1$, then $s_j = 0$. This motivates the addition of the variables $s_j$ to the solution space. We will now try to maximise
+\begin{align}
+\text{Number of pico comparisons included} = \sum_j s_j.
+\end{align}
+Other than the constraint \ref{max_constraint}, there are no additional linear or general constraints for $s_j$. Thus, the only adaptation that must be made to $A$ is that we add extra columns to the matrix to indicate the existence of $s_j$. 
+
+```{r}
+model <- list() #we first need to reset the model to avoid "confusion"
+
+#First we start with the same matrix A as before
+A_ij <- metadataset %>%
+  filter(group_size > 1,contains_random) %>% #we remove groups of less than 2 as this does not allow for comparison
+  arrange(group_size) %>% #arranging by group size will help customise the objective function
+  distinct(pub_id,pico_id) %>%
+  mutate(value = 1,pub_id_2 = pub_id) %>%
+  pivot_wider(id_cols = pub_id,names_from = c(pico_id,pub_id_2),values_from = value,values_fill =  0) #this transforms the data frame into the structure of matrix required
+#We remove the pub_ids from the matrix
+A_ij$pub_id <- NULL
+
+#Now we need the number of pico groups that could be included in the design
+J <- dim(metadataset %>%
+           filter(group_size > 1,contains_random) %>%
+           distinct(pico_id))[1]
+
+#We add the number of possible pico groups as extra empty columns (since there are no linear constraints associated), to matrix A, to indicate the existence of these variables
+A_ij <- cbind(A_ij,
+              matrix(0,nrow = nrow(A_ij),ncol = J))
+
+#Finally we add the matrix to the model
+model$A <- as.matrix(A_ij)
+```
+
+For now we will not worry about the possibility of any quadratic constraints.
+
+There are some minor changes to the constraints that we required in previous sections, which I shall briefly explain:
+
+```{r}
+#The creation of the variable key is the same, this is explained in previous subsections
+
+variable_key <- metadataset %>%
+  filter(group_size > 1,contains_random) %>%
+  arrange(group_size) %>%
+  distinct(pub_id,pico_id,.keep_all = TRUE) %>%
+  select(pub_id,pico_id,randomised)
+variable_key$variables <- 1:dim(variable_key)[1]
+
+variable_key$linear_constraints <- rep(0,dim(variable_key)[1])
+
+variable_key$linear_constraints <- rep(0,dim(variable_key)[1])
+
+for(i in 1:dim(variable_key)[1]){
+  this_pico_id <- filter(variable_key,variables == variable_key$variables[i])$pico_id
+  
+  group_size_constraint <- mutate(variable_key,linear_constraint = ifelse(pico_id == this_pico_id,1,0))$linear_constraint 
+  
+  model$genconind[[2*i-1]] <- list()
+  model$genconind[[2*i-1]]$binvar <- i
+  model$genconind[[2*i-1]]$binval <- 1
+  model$genconind[[2*i-1]]$a <- c(group_size_constraint,rep(0,J)) #the rep(0,J) is because we now have N + J variables, rather than just N variables
+  model$genconind[[2*i-1]]$sense <- ">"
+  model$genconind[[2*i-1]]$rhs <- 2
+
+  random_constraint <- mutate(variable_key,linear_constraint = ifelse(pico_id == this_pico_id & randomised,1,0))$linear_constraint
+  
+  model$genconind[[2*i]] <- list()
+  model$genconind[[2*i]]$binvar <- i
+  model$genconind[[2*i]]$binval <- 1
+  model$genconind[[2*i]]$a <- c(random_constraint,rep(0,J)) #the rep(0,J) is because we now have N + J variables, rather than just N variables
+  model$genconind[[2*i]]$sense <- ">"
+  model$genconind[[2*i]]$rhs <- 1
+}
+```
+
+Now we need to add the \ref{max_constrain} to the model:
+
+```{r}
+for(i in 1:length(unique(variable_key$pico_id))){
+  this_pico_id <- unique(variable_key$pico_id)[i] #we go through each pico_id one by one
+  
+  pico_constraint <- which(mutate(variable_key,linear_constraint = ifelse(pico_id == this_pico_id,1,0))$linear_constraint == 1) #we find the indices of the publications that form this pico group
+  
+  model$genconmax[[i]] <- list()
+  model$genconmax[[i]]$resvar <- i + N #this is the index of variable in the right hand side of the constraint
+  model$genconmax[[i]]$vars <- pico_constraint #these are the indices on which the right hand side depends
+}
+```
+
+Finally, we enter the rest of the model features. This is basically the same as previous subsections, just adjusting for the increased size of $A$:
+
+```{r}
+model$obj <- c(rep(0,N),rep(1,J)) #the objective function is just the total number of pico groups in the comparison
+
+model$modelsense <- "max"
+
+#The right hand side of the linear constraints
+model$rhs <- rep(1,nrow(A_ij))
+
+model$sense <- rep("<",nrow(A_ij))
+
+model$vtype <- "B"
+
+params <- list(OutputFlag=0)
+
+result <- gurobi(model,params)
+```
+
+Using this method, we have `r result$objval` pico groups, which seems significantly more than the other proposed comparisons. However, the number of studies used is much lower, `r sum(result$x[1:N])`, which is `r sum(result$x[1:N])/length(unique(filter(metadataset,group_size>1)$pub_id))` of the available studies.
+
+Visualising the results:
+
+```{r}
+#Creating the data frame for the solution 
+design_frame_by_pico <- metadataset %>%
+  filter(group_size > 1,contains_random) %>% #we remove groups of less than 2 as this does not allow for comparison
+  arrange(group_size) %>% #arranging by group size will help customise the objective function
+  distinct(pub_id,pico_id,.keep_all = TRUE)
+design_frame_by_pico$solution <- result$x[1:N] #adding the gurobi solution
+design_frame_by_pico <- design_frame_by_pico %>%
+  filter(solution == 1) %>%
+  select(-solution) #filtering to just show solution
+
+#Adding new group sizes
+
+new_pico_group_sizes_by_pico <- design_frame_by_pico %>%
+  group_by(pico_id) %>%
+  summarise(new_group_size = n_distinct(pub_id),contains_random = any(randomised))
+
+design_frame_by_pico <- merge(design_frame_by_pico,new_pico_group_sizes_by_pico,by="pico_id")
+design_frame_by_pico
+
+new_pico_group_sizes_by_pico %>%
+  ggplot() +
+  geom_histogram(aes(x = new_group_size),binwidth = 1) +
+  scale_x_continuous(breaks = 0:30*2) +
+  ggtitle("Distribution of comparison group sizes (studies included once, hetero)")
+```
+
+Optimising purely based on the number of pico groups leads to a lot of groups with only two studies, which is probably not what we want. Thus, in order for this method of optimisation to be more fruitful, it will probably be necessary to categorise pico groups by size and request a solution maximising groups of a certain size.
+
