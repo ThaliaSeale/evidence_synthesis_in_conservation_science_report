@@ -5,4 +5,4 @@ Please read the pdf report for the context of project.
 
 You can read the html files using the following links:
 
-https://rawgit.com/ThaliaSeale/evidence_synthesis_in_conservation_science_report/master/index.html
+https://ThaliaSeale/evidence_synthesis_in_conservation_science_report/blob/main/Optimisation%20comparison/optimisation_comparison.html
